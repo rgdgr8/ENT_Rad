@@ -13,8 +13,10 @@ import technology.cariad.entertainment.metadataservice.common.log.logger
 import technology.cariad.entertainment.metadataservice.data.provider.GnServiceRequestNr
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Collections
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.Executors
+import java.util.IdentityHashMap
 
 class RadioplayerSongRecognitionService(
     private val appContext: Context
@@ -33,9 +35,6 @@ class RadioplayerSongRecognitionService(
 
     @Volatile
     private var lastKnownRpuid: String? = null
-
-    @Volatile
-    private var lastKnownStationFingerprint: String? = null
 
     @Volatile
     private var lastRecognitionFingerprint: String? = null
@@ -76,20 +75,7 @@ class RadioplayerSongRecognitionService(
         recognitionRequested = true
         callbacks.forEach { it.onStatus(RadioplayerRecognitionStatus.RUNNING) }
 
-        val currentStationFingerprint = resolveCurrentStationFingerprint()
-        if (!currentStationFingerprint.isNullOrBlank()) {
-            val normalizedFingerprint = normalizeStationFingerprint(currentStationFingerprint)
-            val previousFingerprint = lastKnownStationFingerprint
-            if (!previousFingerprint.isNullOrBlank() && normalizedFingerprint != previousFingerprint) {
-                log.info(this::startSongRecognition.name) {
-                    "station changed: $previousFingerprint -> $normalizedFingerprint; invalidating stale RPUID=${lastKnownRpuid ?: "<none>"}"
-                }
-                lastKnownRpuid = null
-            }
-            lastKnownStationFingerprint = normalizedFingerprint
-        }
-
-        val rpuid = lastKnownRpuid ?: resolveRpuidFromActiveMediaBrowser()
+        val rpuid = resolveRpuidFromActiveMediaBrowser()
         if (rpuid.isNullOrBlank()) {
             log.warn(this::startSongRecognition.name) {
                 "No RPUID available yet; deferring Radioplayer metadata subscription"
@@ -354,55 +340,7 @@ class RadioplayerSongRecognitionService(
     }
 
 
-    private fun stationFrequencyValue(station: Any?): String {
-        if (station == null) return ""
-        return sequenceOf(
-            "getFrequency",
-            "getFrequencyKhz",
-            "getFrequencyHz",
-            "getStationFrequency",
-            "getFrequencyInKhz",
-            "getFrequencyInHz"
-        )
-            .map { invokeString(station, it) }
-            .firstOrNull { it.isNotBlank() }
-            .orEmpty()
-    }
-
-    private fun stationBandValue(station: Any?): String {
-        if (station == null) return ""
-        return sequenceOf(
-            "getBand",
-            "getStationBand",
-            "getType",
-            "getMedium"
-        )
-            .map { invokeString(station, it) }
-            .filter { it.isNotBlank() }
-            .firstOrNull()
-            ?.lowercase()
-            .orEmpty()
-    }
-
-    private fun matchesFrequencyApprox(actual: String?, expected: String?): Boolean {
-        if (actual.isNullOrBlank() || expected.isNullOrBlank()) return false
-
-        val actualNumber = actual.filter { it.isDigit() || it == '.' || it == ',' }
-            .replace(',', '.')
-            .toDoubleOrNull() ?: return false
-        val expectedNumber = expected.filter { it.isDigit() || it == '.' || it == ',' }
-            .replace(',', '.')
-            .toDoubleOrNull() ?: return false
-
-        return kotlin.math.abs(actualNumber - expectedNumber) < 0.5
-    }
-
     private fun resolveRpuidFromActiveMediaBrowser(): String? {
-        val currentStationFingerprint = resolveCurrentStationFingerprint()
-            ?.let(::normalizeStationFingerprint)
-            ?.takeIf { it.isNotBlank() }
-            ?: return null
-
         val mediaSessionManager = runCatching {
             appContext.getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
         }.getOrNull() ?: return null
@@ -411,249 +349,163 @@ class RadioplayerSongRecognitionService(
             mediaSessionManager.getActiveSessions(null)
         }.getOrNull() ?: return null
 
-        return activeSessions.firstNotNullOfOrNull { controller ->
-            val controllerStationFingerprint = extractStationFingerprintFromController(controller)
-                ?.let(::normalizeStationFingerprint)
-                ?.takeIf { it.isNotBlank() }
+        val activeIdentity = resolveActiveTunerIdentity(activeSessions) ?: return null
+        val browserRoots = activeSessions.flatMap { controller ->
+            listOfNotNull(
+                readCurrentMediaItem(controller),
+                readQueue(controller)
+            )
+        }
+        val browserRpuid = findRpuidInTree(browserRoots, activeIdentity)
+        if (!browserRpuid.isNullOrBlank()) {
+            return browserRpuid
+        }
 
-            if (!controllerStationFingerprint.isNullOrBlank() && controllerStationFingerprint != currentStationFingerprint) {
-                log.info(this::resolveRpuidFromActiveMediaBrowser.name) {
-                    "Skipping stale controller RPUID for station fingerprint=$controllerStationFingerprint; active station is $currentStationFingerprint"
+        val sessionRoots = activeSessions.flatMap { controller ->
+            listOfNotNull(readMetadataExtras(controller), controller.metadata)
+        }
+        return findRpuidInTree(sessionRoots, activeIdentity)
+    }
+
+    private data class StationIdentity(
+        val bearer: String? = null,
+        val service: String? = null,
+        val mediaId: String? = null
+    ) {
+        fun matches(other: StationIdentity): Boolean {
+            return listOf(bearer to other.bearer, service to other.service, mediaId to other.mediaId)
+                .any { (expected, actual) ->
+                    !expected.isNullOrBlank() && !actual.isNullOrBlank() && expected == actual
                 }
-                return@firstNotNullOfOrNull null
-            }
-
-            extractRpuidFromController(controller)
         }
     }
 
-    private fun resolveCurrentStationFingerprint(): String? {
-        val mediaSessionManager = runCatching {
-            appContext.getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
-        }.getOrNull() ?: return null
-
-        val activeSessions = runCatching {
-            mediaSessionManager.getActiveSessions(null)
-        }.getOrNull() ?: return null
-
-        val activeStationFingerprint = resolveCurrentStationFingerprint()
-        if (activeStationFingerprint.isNullOrBlank()) {
-            log.warn(this::resolveRpuidFromActiveMediaBrowser.name) {
-                "Skipping RPUID resolution because active media-browser station fingerprint is unavailable"
+    private fun resolveActiveTunerIdentity(activeSessions: List<MediaController>): StationIdentity? {
+        val visited = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>())
+        return activeSessions.asSequence()
+            .flatMap { controller ->
+                sequenceOf(
+                    readCurrentMediaItem(controller),
+                    readMetadataExtras(controller),
+                    controller.metadata
+                )
             }
-            return null
-        }
-
-        return activeSessions.firstNotNullOfOrNull { controller ->
-            extractRpuidFromController(controller, activeStationFingerprint)
-        }
+            .mapNotNull { root -> findStationIdentity(root, visited, 0) }
+            .firstOrNull()
     }
 
-    private fun extractStationFingerprintFromController(controller: MediaController): String? {
-        val candidateBundles = mutableListOf<Bundle>()
-        readMetadataExtras(controller)?.let { candidateBundles += it }
-        readCurrentMediaItemExtras(controller)?.let { candidateBundles += it }
-        readQueueItemExtras(controller)?.let { candidateBundles += it }
-
-        for (bundle in candidateBundles) {
-            val title = extractStationNameFromBundle(bundle)
-            if (!title.isNullOrBlank()) {
-                return title
-            }
+    private fun extractStationIdentity(value: Any?): StationIdentity? {
+        if (value == null) return null
+        if (value is Bundle) {
+            return StationIdentity(
+                bearer = firstBundleValue(value, "bearer", "stationBearer", "radioBearer"),
+                service = firstBundleValue(value, "serviceId", "stationServiceId", "dabServiceId", "sid"),
+                mediaId = firstBundleValue(value, "mediaId", "media_id", "android.media.metadata.MEDIA_ID")
+            ).takeIf { it.bearer != null || it.service != null || it.mediaId != null }
         }
 
-        return null
+        return StationIdentity(
+            bearer = firstObjectValue(value, "getBearer", "getStationBearer", "getRadioBearer"),
+            service = firstObjectValue(value, "getServiceId", "getStationServiceId", "getDabServiceId", "getSid"),
+            mediaId = firstObjectValue(value, "getMediaId")
+        ).takeIf { it.bearer != null || it.service != null || it.mediaId != null }
     }
 
-    private fun extractStationNameFromBundle(bundle: Bundle): String? {
-        val preferredKeys = listOf(
-            "android.media.metadata.TITLE",
-            "android.media.metadata.DISPLAY_TITLE",
-            "android.media.metadata.MEDIA_ID",
-            "android.title",
-            "title",
-            "stationName",
-            "simpleStationName",
-            "radioStationName",
-            "serviceName",
-            "programName",
-            "station",
-            "name"
-        )
-
-        for (key in preferredKeys) {
-            val value = bundle.get(key)
-            if (value is String && value.isNotBlank() && !value.equals("null", ignoreCase = true)) {
-                return normalizeStationFingerprint(value)
-            }
-        }
-
-        for (key in bundle.keySet()) {
-            val value = bundle.get(key)
-            if (value is Bundle) {
-                val nested = extractStationNameFromBundle(value)
-                if (!nested.isNullOrBlank()) {
-                    return nested
-                }
-            }
-            if (key.lowercase().contains("title") || key.lowercase().contains("station") || key.lowercase().contains("program")) {
-                if (value is String && value.isNotBlank() && !value.equals("null", ignoreCase = true)) {
-                    return normalizeStationFingerprint(value)
-                }
-            }
-        }
-
-        return null
+    private fun findStationIdentity(value: Any?, visited: MutableSet<Any>, depth: Int): StationIdentity? {
+        if (value == null || depth > 12 || !visited.add(value)) return null
+        return extractStationIdentity(value)
+            ?: treeChildren(value).asSequence()
+                .mapNotNull { child -> findStationIdentity(child, visited, depth + 1) }
+                .firstOrNull()
     }
 
-    private fun normalizeStationFingerprint(value: String): String {
-        return value.trim().replace("\\s+".toRegex(), " ").lowercase().replace("[^a-z0-9]".toRegex(), "")
+    private fun firstBundleValue(bundle: Bundle, vararg keys: String): String? {
+        return keys.asSequence()
+            .mapNotNull { bundle.get(it)?.toString() }
+            .map(::normalizeIdentityValue)
+            .firstOrNull { it.isNotBlank() }
     }
 
-    private fun extractRpuidFromController(
-        controller: MediaController,
-        activeStationFingerprint: String? = null
-    ): String? {
-        val candidateBundles = mutableListOf<Bundle>()
-
-        readMetadataExtras(controller)?.let { candidateBundles += it }
-        readCurrentMediaItemExtras(controller)?.let { candidateBundles += it }
-        readQueueItemExtras(controller)?.let { candidateBundles += it }
-
-        val normalizedActiveStationFingerprint = activeStationFingerprint?.let(::normalizeStationFingerprint)
-
-        for (bundle in candidateBundles) {
-            if (!normalizedActiveStationFingerprint.isNullOrBlank()) {
-                val bundleStationFingerprint = extractStationNameFromBundle(bundle)
-                if (!bundleStationFingerprint.isNullOrBlank() && normalizeStationFingerprint(bundleStationFingerprint) != normalizedActiveStationFingerprint) {
-                    continue
-                }
-            }
-
-            val exact = extractRpuidFromBundle(bundle, exactOnly = true)
-            if (!exact.isNullOrBlank()) {
-                log.info("RPUID_FETCH_CONFIRMATION") {
-                    "Successfully fetched RadioPlayerId from active media browser exact key: $exact"
-                }
-                return exact
-            }
-
-            val fuzzy = extractRpuidFromBundle(bundle, exactOnly = false)
-            if (!fuzzy.isNullOrBlank()) {
-                log.info("RPUID_FETCH_CONFIRMATION") {
-                    "Successfully fetched RadioPlayerId from active media browser fuzzy key: $fuzzy"
-                }
-                return fuzzy
-            }
-        }
-
-        return null
+    private fun firstObjectValue(value: Any, vararg methods: String): String? {
+        return methods.asSequence()
+            .mapNotNull { invokeNoArg(value, it)?.toString() }
+            .map(::normalizeIdentityValue)
+            .firstOrNull { it.isNotBlank() }
     }
 
-    private fun readCurrentMediaItemExtras(controller: MediaController): List<Bundle> {
-        val bundles = mutableListOf<Bundle>()
+    private fun normalizeIdentityValue(value: String): String {
+        return value.trim().lowercase()
+    }
 
-        val currentItem = runCatching {
+    private fun readCurrentMediaItem(controller: MediaController): Any? {
+        return runCatching {
             controller.javaClass.methods
                 .firstOrNull { it.name == "getCurrentMediaItem" && it.parameterCount == 0 }
                 ?.invoke(controller)
-        }.getOrNull() ?: return bundles
-
-        val description = runCatching {
-            currentItem.javaClass.methods
-                .firstOrNull { it.name == "getDescription" && it.parameterCount == 0 }
-                ?.invoke(currentItem)
-        }.getOrNull() ?: return bundles
-
-        val extras = runCatching {
-            description.javaClass.methods
-                .firstOrNull { it.name == "getExtras" && it.parameterCount == 0 }
-                ?.invoke(description) as? Bundle
-        }.getOrNull() ?: return bundles
-
-        if (extras.keySet().isNotEmpty()) {
-            bundles += extras
-        }
-
-        return bundles
+        }.getOrNull()
     }
 
-    private fun readQueueItemExtras(controller: MediaController): List<Bundle> {
-        val bundles = mutableListOf<Bundle>()
-
-        val queue = runCatching {
+    private fun readQueue(controller: MediaController): Any? {
+        return runCatching {
             controller.javaClass.methods
                 .firstOrNull { it.name == "getQueue" && it.parameterCount == 0 }
                 ?.invoke(controller)
-        }.getOrNull() ?: return bundles
-
-        val queueItems = when (queue) {
-            is Iterable<*> -> queue
-            is Collection<*> -> queue
-            else -> null
-        } ?: return bundles
-
-        for (queueItem in queueItems) {
-            val description = runCatching {
-                queueItem?.javaClass?.methods
-                    ?.firstOrNull { it.name == "getDescription" && it.parameterCount == 0 }
-                    ?.invoke(queueItem)
-            }.getOrNull() ?: continue
-
-            val extras = runCatching {
-                description.javaClass.methods
-                    .firstOrNull { it.name == "getExtras" && it.parameterCount == 0 }
-                    ?.invoke(description) as? Bundle
-            }.getOrNull() ?: continue
-
-            if (extras.keySet().isNotEmpty()) {
-                bundles += extras
-            }
-        }
-
-        return bundles
+        }.getOrNull()
     }
 
-    private fun extractRpuidFromBundle(bundle: Bundle, exactOnly: Boolean): String? {
-        val exactKeys = preferredRpuidKeys()
-        for (key in exactKeys) {
-            val value = bundle.get(key)
-            val parsed = parseRpuidCandidate(value)
-            if (!parsed.isNullOrBlank()) {
-                return parsed
-            }
-        }
+    private fun readMetadataExtras(controller: MediaController): Bundle? {
+        val metadata = controller.metadata ?: return null
+        return runCatching {
+            metadata.javaClass.methods
+                .firstOrNull { it.name == "getExtras" && it.parameterCount == 0 }
+                ?.invoke(metadata) as? Bundle
+        }.getOrNull()
+    }
 
-        if (exactOnly) {
-            return null
-        }
+    private fun findRpuidInTree(roots: List<Any?>, activeIdentity: StationIdentity): String? {
+        val visited = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>())
+        return roots.asSequence()
+            .mapNotNull { searchRpuid(it, activeIdentity, null, visited, 0) }
+            .firstOrNull()
+    }
 
-        val fuzzyKeys = bundle.keySet()
-            .filter { isLikelyRpuidKey(it) }
-            .sortedBy { it.length }
+    private fun searchRpuid(
+        value: Any?,
+        activeIdentity: StationIdentity,
+        inheritedIdentity: StationIdentity?,
+        visited: MutableSet<Any>,
+        depth: Int
+    ): String? {
+        if (value == null || depth > 12 || !visited.add(value)) return null
 
-        for (key in fuzzyKeys) {
-            val value = bundle.get(key)
-            val parsed = parseRpuidCandidate(value)
-            if (!parsed.isNullOrBlank()) {
-                return parsed
-            }
-        }
-
-        for (key in bundle.keySet()) {
-            val value = bundle.get(key)
-            if (value is Bundle) {
-                val nested = extractRpuidFromBundle(value, exactOnly = false)
-                if (!nested.isNullOrBlank()) {
-                    return nested
+        val identity = extractStationIdentity(value) ?: inheritedIdentity
+        if (identity != null && activeIdentity.matches(identity)) {
+            extractExactRpuid(value)?.let { rpuid ->
+                log.info("RPUID_FETCH_CONFIRMATION") {
+                    "Resolved RadioPlayerId=$rpuid using active tuner identity"
                 }
+                return rpuid
             }
         }
 
-        return null
+        return treeChildren(value).asSequence()
+            .mapNotNull { child -> searchRpuid(child, activeIdentity, identity, visited, depth + 1) }
+            .firstOrNull()
     }
 
-    private fun preferredRpuidKeys(): List<String> = listOf(
+    private fun extractExactRpuid(value: Any): String? {
+        if (value is Bundle) {
+            return exactRpuidKeys.asSequence()
+                .mapNotNull { key -> parseRpuidCandidate(value.get(key)) }
+                .firstOrNull()
+        }
+
+        return exactRpuidMethods.asSequence()
+            .mapNotNull { method -> parseRpuidCandidate(invokeNoArg(value, method)) }
+            .firstOrNull()
+    }
+
+    private val exactRpuidKeys = listOf(
         "de.eso.radio.radioplayerId",
         "de.eso.radio.rpuid",
         "de.eso.radio.RADIOPLAYER_ID",
@@ -670,22 +522,13 @@ class RadioplayerSongRecognitionService(
         "radio_station_id"
     )
 
-    private fun isLikelyRpuidKey(key: String): Boolean {
-        val normalized = key.lowercase().replace("[^a-z0-9]".toRegex(), "")
-        val hasRpuidMarker = normalized.contains("rpuid")
-        val hasRadioplayerMarker = normalized.contains("radioplayer")
-        val hasStationIdMarker = normalized.contains("station") && normalized.contains("id")
-        return hasRpuidMarker || hasRadioplayerMarker || hasStationIdMarker
-    }
-
-    private fun readMetadataExtras(controller: MediaController): Bundle? {
-        val metadata = controller.metadata ?: return null
-        return runCatching {
-            metadata.javaClass.methods
-                .firstOrNull { it.name == "getExtras" && it.parameterCount == 0 }
-                ?.invoke(metadata) as? Bundle
-        }.getOrNull()
-    }
+    private val exactRpuidMethods = listOf(
+        "getRadioplayerId",
+        "getRpuid",
+        "getRadioPlayerId",
+        "getStationId",
+        "getRadioStationId"
+    )
 
     private fun parseRpuidCandidate(value: Any?): String? {
         return when (value) {
@@ -694,8 +537,7 @@ class RadioplayerSongRecognitionService(
                 when {
                     sanitized.isEmpty() -> null
                     sanitized.equals("null", ignoreCase = true) -> null
-                    sanitized.any { it.isDigit() } -> sanitized
-                    else -> null
+                    else -> sanitized
                 }
             }
             is Number -> value.toString().trim().takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
@@ -706,6 +548,23 @@ class RadioplayerSongRecognitionService(
             }
             else -> null
         }?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+    }
+
+    private fun treeChildren(value: Any): List<Any> {
+        return when (value) {
+            is Bundle -> value.keySet().mapNotNull { value.get(it) }
+            is Iterable<*> -> value.filterNotNull()
+            is Array<*> -> value.filterNotNull()
+            else -> listOfNotNull(
+                invokeNoArg(value, "getDescription"),
+                invokeNoArg(value, "getExtras"),
+                invokeNoArg(value, "getMetadata"),
+                invokeNoArg(value, "getCurrentMediaItem"),
+                invokeNoArg(value, "getQueue"),
+                invokeNoArg(value, "getMediaItem"),
+                invokeNoArg(value, "getMediaDescription")
+            )
+        }
     }
 
     private fun fetchImageBytes(url: String?): ByteArray? {
