@@ -5,6 +5,15 @@ import android.content.Context
 import android.content.pm.PackageManager
 import androidx.annotation.MainThread
 import androidx.preference.PreferenceManager
+import androidx.work.WorkInfo
+import org.radioplayer.automotiveSDK.ConsentManagementModule.CmpConsent
+import org.radioplayer.automotiveSDK.VehicleInfo
+import org.radioplayer.automotive.core.AutomotiveSDK
+import org.radioplayer.automotive.core.AutomotiveSDKConfig
+import org.radioplayer.automotive.core.AutomotiveSDKDefaultConfig
+import org.radioplayer.automotive.core.DataPlatformSDKConfig
+import org.radioplayer.automotive.core.tasks.TaskListener
+import org.radioplayer.automotive.core.tasks.constants.Tasks
 import technology.cariad.entertainment.metadataservice.common.assetmanager.AssetManager
 import technology.cariad.entertainment.metadataservice.common.codingprovider.CodingManager
 import technology.cariad.entertainment.metadataservice.common.codingprovider.data.MediaCodingValues
@@ -23,6 +32,7 @@ import technology.cariad.entertainment.metadataservice.service.di.DomainComponen
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import java.nio.file.Paths
+import java.util.UUID
 
 @MainThread
 open class MetadataServiceApp : Application() {
@@ -99,6 +109,7 @@ open class MetadataServiceApp : Application() {
     private fun initializeApplication(storageRoot: String) {
         //MagicAdapter init must be called before MDS uses SL or DR
         MagicAdapter().init(this)
+        initializeRadioplayerSdk(storageRoot)
         appComponent = AppComponentBuilder.build(this, storageRoot)
         config = DemoConfigProvider(PreferenceManager.getDefaultSharedPreferences(this))
         AppComponentBuilder.initialize(appComponent, scope)
@@ -109,6 +120,59 @@ open class MetadataServiceApp : Application() {
         isInitialized = true
 
         log.info(this::initializeApplication.name) { "initialization successful" }
+    }
+
+    private fun initializeRadioplayerSdk(storageRoot: String) {
+        runCatching { AutomotiveSDK.services }
+            .onSuccess {
+                log.info(this::initializeRadioplayerSdk.name) {
+                    "Radioplayer SDK already initialized"
+                }
+            }
+            .onFailure {
+                runCatching {
+                    val sdkConfig = AutomotiveSDKConfig(
+                        "metadata-service",
+                        "",
+                        "",
+                        BuildConfig.APPLICATION_ID,
+                        BuildConfig.VERSION_NAME,
+                        AutomotiveSDKDefaultConfig.BASE_URL,
+                        "cariad"
+                    )
+                    val dataPlatformConfig = DataPlatformSDKConfig(
+                        AutomotiveSDKDefaultConfig.BASE_URL,
+                        "",
+                        VehicleInfo("automotive", "cariad", 2026),
+                        CmpConsent.essentialOnly()
+                    )
+                    val taskListener = object : TaskListener {
+                        override fun onWorkerStateChange(
+                            id: UUID,
+                            task: Tasks,
+                            state: WorkInfo.State
+                        ) {
+                            log.info("RadioplayerTaskState") {
+                                "task=$task state=$state id=$id"
+                            }
+                        }
+                    }
+
+                    AutomotiveSDK.init(
+                        storageRoot,
+                        taskListener,
+                        sdkConfig,
+                        dataPlatformConfig
+                    )
+                    log.info(this::initializeRadioplayerSdk.name) {
+                        "Radioplayer SDK initialization requested"
+                    }
+                }.onFailure { initializationError ->
+                    log.error(this::initializeRadioplayerSdk.name) {
+                        "Radioplayer SDK initialization failed: ${initializationError.message}"
+                    }
+                }
+            }
     }
 
     /**

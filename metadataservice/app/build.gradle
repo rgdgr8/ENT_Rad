@@ -124,6 +124,7 @@ def quoteBuildConfigString = { value ->
 
 def gnsdkArm64LibDir = file("$projectDir/../../gnsdk-auto-2.6.19.14264-20250729/lib/android_arm64-v8a")
 def gnsdkX8664LibDir = file("$projectDir/../../gnsdk-auto-2.6.19.14264-20250729/lib/android_x86_64")
+def gnsdkRootDir = file("$projectDir/../../gnsdk-auto-2.6.19.14264-20250729")
 def generatedGnsdkJniLibsDir = file("$buildDir/generated/gnsdkJniLibs")
 
 def aidlPath = "../../esoSDK/aosp-artifacts/aidls"
@@ -212,9 +213,10 @@ android {
         }
 
         // Native build configuration for Gracenote SDK (standalone without Conan)
-        externalNativeBuild {
-            cmake {
-                cppFlags "-std=c++14 -Wall" +
+        if (gnsdkRootDir.isDirectory()) {
+            externalNativeBuild {
+                cmake {
+                    cppFlags "-std=c++14 -Wall" +
                         " -Werror=address" +
                         " -Werror=array-bounds" +
                         " -Werror=uninitialized" +
@@ -270,7 +272,8 @@ android {
                         " -Werror=int-conversion" +
                         " -Werror=pointer-to-int-cast"
 
-                arguments "-DANDROID_STL=c++_shared"
+                    arguments "-DANDROID_STL=c++_shared"
+                }
             }
         }
 
@@ -367,13 +370,15 @@ android {
     }
 
     // Native build configuration (standalone without Conan)
-    externalNativeBuild {
-        cmake {
-            path 'src/main/cpp/CMakeLists.txt'
+    if (gnsdkRootDir.isDirectory()) {
+        externalNativeBuild {
+            cmake {
+                path 'src/main/cpp/CMakeLists.txt'
 
-            if (project.hasProperty("NATIVE_OUTPUT")) {
-                version "3.28.5"
-                buildStagingDirectory project.properties["NATIVE_OUTPUT"]
+                if (project.hasProperty("NATIVE_OUTPUT")) {
+                    version "3.28.5"
+                    buildStagingDirectory project.properties["NATIVE_OUTPUT"]
+                }
             }
         }
     }
