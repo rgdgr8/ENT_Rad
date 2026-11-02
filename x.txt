@@ -1,0 +1,9 @@
+searches the current media item, metadata extras, and related media objects for an identity containing one or more of:
+
+bearer
+service ID / SID
+DAB service ID
+media ID
+The first usable identity becomes the active station identity.
+
+Important limitation: the current implementation does not directly query the hardware tuner API. It derives the active identity from media-session/media-browser data exposed by the radio application.
