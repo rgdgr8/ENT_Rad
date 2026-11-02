@@ -1,9 +1,37 @@
-searches the current media item, metadata extras, and related media objects for an identity containing one or more of:
+Do not use “first usable identity found” unless your search order is deterministic and ranked by reliability.
 
-bearer
-service ID / SID
-DAB service ID
-media ID
-The first usable identity becomes the active station identity.
+Otherwise you could accidentally select a stale mediaId while a better DAB SID is available.
 
-Important limitation: the current implementation does not directly query the hardware tuner API. It derives the active identity from media-session/media-browser data exposed by the radio application.
+Recommended strategy
+
+Radio application's exposed media data
+                │
+                ▼
+     Identify CURRENT media/station
+                │
+                ▼
+ Search its identity-bearing fields
+                │
+       ┌────────┼──────────┐
+       ▼        ▼          ▼
+    Bearer     SID      DAB identifiers
+       │        │
+       └────┬───┘
+            │
+       preferred identity
+            │
+            ▼
+         mediaId
+        (fallback)
+            │
+            ▼
+   Active station identity
+            │
+            ▼
+ Correlate with MediaBrowser item
+            │
+            ▼
+           RPUID
+            │
+            ▼
+          RPSDK
